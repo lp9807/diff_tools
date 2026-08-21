@@ -1,287 +1,324 @@
 """
-part3_prediction.py
-预测和自动分类
+part3_pair_prediction.py
+自动分类所有成对图片 - 基于你的 config.json
+
+流程：
+1. 先计算 SSIM 相似度
+2. SSIM ≥ 阈值(默认0.999) → 自动标记为 matched
+3. SSIM < 阈值 → 用模型预测
+
+共享配置: model_config.py
+依赖: scikit-image (pip install scikit-image)
 """
 
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms, models
-import numpy as np
-import pandas as pd
-from pathlib import Path
-from PIL import Image
-from tqdm import tqdm
 import json
+import torch
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from PIL import Image
+from pathlib import Path
 import shutil
+import cv2
+import numpy as np
+from tqdm import tqdm
 from datetime import datetime
+from skimage.metrics import structural_similarity as ssim
+from collections import defaultdict
 
-class Predictor:
-    """预测器"""
-    
-    def __init__(self, model_path, model_name='resnet18', num_classes=2, device=None):
-        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.classes = ['quality_improved', 'render_failed']
-        
-        # 加载模型
-        if model_name == 'resnet18':
-            self.model = models.resnet18(pretrained=False)
-            num_features = self.model.fc.in_features
-            self.model.fc = nn.Sequential(
-                nn.Dropout(0.5),
-                nn.Linear(num_features, 256),
-                nn.ReLU(),
-                nn.Dropout(0.3),
-                nn.Linear(256, num_classes)
-            )
-        else:
-            raise ValueError(f"不支持的模型: {model_name}")
-        
-        checkpoint = torch.load(model_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.model = self.model.to(self.device)
-        self.model.eval()
-        
-        print(f"✅ 模型加载完成: {model_path}")
-        
-        # 数据变换
-        self.transform = transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                               std=[0.229, 0.224, 0.225])
-        ])
-    
-    def predict_single(self, image_path):
-        """预测单张图像"""
-        image = Image.open(image_path).convert('RGB')
-        image_tensor = self.transform(image).unsqueeze(0).to(self.device)
-        
-        with torch.no_grad():
-            outputs = self.model(image_tensor)
-            probabilities = torch.softmax(outputs, dim=1)
-            confidence, predicted = torch.max(probabilities, dim=1)
-        
-        label = self.classes[predicted.item()]
-        confidence_score = confidence.item()
-        
-        return label, confidence_score
-    
-    def predict_batch(self, image_paths, batch_size=32):
-        """批量预测"""
-        results = []
-        
-        for i in tqdm(range(0, len(image_paths), batch_size), desc='预测中'):
-            batch_paths = image_paths[i:i+batch_size]
-            batch_images = []
-            
-            for img_path in batch_paths:
-                image = Image.open(img_path).convert('RGB')
-                image_tensor = self.transform(image)
-                batch_images.append(image_tensor)
-            
-            batch_tensor = torch.stack(batch_images).to(self.device)
-            
-            with torch.no_grad():
-                outputs = self.model(batch_tensor)
-                probabilities = torch.softmax(outputs, dim=1)
-                confidence, predictions = torch.max(probabilities, dim=1)
-            
-            for img_path, pred, conf in zip(batch_paths, predictions, confidence):
-                results.append({
-                    'image_path': str(img_path),
-                    'image_name': img_path.name,
-                    'predicted_class': self.classes[pred.item()],
-                    'confidence': conf.item(),
-                    'is_high_confidence': conf.item() > 0.85
-                })
-        
-        return results
+# ============================================================
+# 导入共享配置
+# ============================================================
 
-class AutoClassifier:
-    """自动分类器"""
+from model_config import (
+    TRAIN_CLASSES, CLASS_TO_IDX, LABEL_DISPLAY,
+    SiameseNetwork, create_model, load_model, find_model_file,
+    SSIM_THRESHOLD
+)
+
+# ============================================================
+# 加载配置
+# ============================================================
+
+with open('config.json', 'r', encoding='utf-8') as f:
+    CONFIG = json.load(f)
+
+BEFORE_DIR = Path(CONFIG['folders']['before'])
+AFTER_DIR = Path(CONFIG['folders']['after'])
+PROJECT_DIR = Path(CONFIG['folders']['project'])
+OUTPUT_DIR = PROJECT_DIR / "06_final_output"
+CHECKPOINT_DIR = PROJECT_DIR / "checkpoints"
+THRESHOLD = CONFIG['classification']['confidence_threshold']
+EXTENSIONS = CONFIG['pairing']['extensions']
+
+# ============================================================
+# 预测数据集
+# ============================================================
+
+class PairPredictionDataset(Dataset):
+    def __init__(self, before_dir, after_dir, transform=None):
+        self.before_dir = Path(before_dir)
+        self.after_dir = Path(after_dir)
+        self.transform = transform
+        self.pairs = self.match_pairs()
+        print(f"找到 {len(self.pairs)} 对待预测")
     
-    def __init__(self, model_path, input_dir, output_dir):
-        self.predictor = Predictor(model_path)
-        self.input_dir = Path(input_dir)
-        self.output_dir = Path(output_dir)
-        self.results = []
+    def match_pairs(self):
+        def get_files(directory):
+            files = []
+            for ext in EXTENSIONS:
+                files.extend(directory.glob(f'*{ext}'))
+                files.extend(directory.glob(f'*{ext.upper()}'))
+            return {f.stem: f for f in files}
         
-    def classify_all(self, threshold=0.85):
-        """分类所有图像"""
-        # 获取所有图像
-        images = []
-        for ext in ['*.jpg', '*.jpeg', '*.png', '*.bmp']:
-            images.extend(self.input_dir.glob(ext))
+        before_files = get_files(self.before_dir)
+        after_files = get_files(self.after_dir)
         
-        print(f"待分类图像: {len(images)} 张")
-        
-        # 批量预测
-        self.results = self.predictor.predict_batch(images)
-        
-        # 分类并保存
-        high_conf_indices = []
-        low_conf_indices = []
-        
-        for idx, result in enumerate(self.results):
-            image_path = Path(result['image_path'])
-            predicted_class = result['predicted_class']
-            confidence = result['confidence']
+        common_names = set(before_files.keys()) & set(after_files.keys())
+        pairs = []
+        for name in common_names:
+            pairs.append({
+                'name': name,
+                'before': before_files[name],
+                'after': after_files[name]
+            })
+        return pairs
+    
+    def __len__(self):
+        return len(self.pairs)
+    
+    def __getitem__(self, idx):
+        pair = self.pairs[idx]
+        before = Image.open(pair['before']).convert('RGB')
+        after = Image.open(pair['after']).convert('RGB')
+        if self.transform:
+            before = self.transform(before)
+            after = self.transform(after)
+        return before, after, pair['name'], str(pair['before']), str(pair['after'])
+
+
+# ============================================================
+# SSIM 计算工具
+# ============================================================
+
+class SSIMComparator:
+    """SSIM 相似度计算工具"""
+    
+    @staticmethod
+    def compute_ssim(img1_path, img2_path):
+        try:
+            img1 = cv2.imread(str(img1_path))
+            img2 = cv2.imread(str(img2_path))
             
-            if result['is_high_confidence']:
-                # 高置信度：自动分类
-                dest_dir = self.output_dir / predicted_class
-                dest_dir.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(image_path, dest_dir / image_path.name)
-                high_conf_indices.append(idx)
-            else:
-                # 低置信度：需要人工复核
-                dest_dir = self.output_dir / 'to_review'
-                dest_dir.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(image_path, dest_dir / image_path.name)
-                low_conf_indices.append(idx)
-        
-        # 生成报告
-        self.generate_report(high_conf_indices, low_conf_indices)
-        
-        return self.results
-    
-    def generate_report(self, high_indices, low_indices):
-        """生成分类报告"""
-        # 统计
-        total = len(self.results)
-        auto_count = len(high_indices)
-        review_count = len(low_indices)
-        automation_rate = auto_count / total * 100
-        
-        # 类别统计
-        class_counts = {}
-        for result in self.results:
-            cls = result['predicted_class']
-            class_counts[cls] = class_counts.get(cls, 0) + 1
-        
-        # 置信度分布
-        confidences = [r['confidence'] for r in self.results]
-        
-        report = {
-            'total_images': total,
-            'auto_classified': auto_count,
-            'needs_review': review_count,
-            'automation_rate': automation_rate,
-            'class_distribution': class_counts,
-            'confidence_stats': {
-                'mean': np.mean(confidences),
-                'std': np.std(confidences),
-                'min': np.min(confidences),
-                'max': np.max(confidences)
-            },
-            'threshold_used': 0.85,
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        # 保存报告
-        report_file = self.output_dir / 'classification_report.json'
-        with open(report_file, 'w') as f:
-            json.dump(report, f, indent=2)
-        
-        # 保存详细结果
-        df = pd.DataFrame(self.results)
-        df.to_csv(self.output_dir / 'classification_details.csv', index=False)
-        
-        # 打印摘要
-        print("\n" + "="*60)
-        print("📊 分类报告")
-        print("="*60)
-        print(f"总图像数: {total}")
-        print(f"自动分类: {auto_count} ({automation_rate:.1f}%)")
-        print(f"需要复核: {review_count} ({100-automation_rate:.1f}%)")
-        print(f"\n类别分布:")
-        for cls, count in class_counts.items():
-            print(f"  {cls}: {count} 张 ({count/total*100:.1f}%)")
-        print(f"\n置信度统计:")
-        for key, value in report['confidence_stats'].items():
-            print(f"  {key}: {value:.3f}")
-        print(f"\n✅ 报告保存至: {report_file}")
-        print(f"详细结果: {self.output_dir / 'classification_details.csv'}")
+            if img1 is None or img2 is None:
+                return 0.0
+            
+            img1_gray = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+            img2_gray = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+            
+            if img1_gray.shape != img2_gray.shape:
+                h = min(img1_gray.shape[0], img2_gray.shape[0])
+                w = min(img1_gray.shape[1], img2_gray.shape[1])
+                img1_gray = cv2.resize(img1_gray, (w, h))
+                img2_gray = cv2.resize(img2_gray, (w, h))
+            
+            score, _ = ssim(img1_gray, img2_gray, full=True)
+            return score
+        except Exception as e:
+            print(f"⚠️ SSIM 计算失败: {e}")
+            return 0.0
 
-def find_best_model(checkpoints_dir='./project/checkpoints'):
-    """
-    自动查找最佳的模型文件
-    优先级: best_model_*.pth > final_model.pth > 任何 .pth 文件
-    """
-    checkpoints_path = Path(checkpoints_dir)
-    
-    if not checkpoints_path.exists():
-        print(f"❌ 模型目录不存在: {checkpoints_path}")
-        return None
-    
-    # 查找所有模型文件
-    all_models = list(checkpoints_path.glob('*.pth'))
-    
-    if not all_models:
-        print(f"❌ 在 {checkpoints_path} 中没有找到任何模型文件")
-        return None
-    
-    # 优先选择 best_model 开头的文件
-    best_models = [f for f in all_models if f.name.startswith('best_model')]
-    if best_models:
-        # 按修改时间排序，选择最新的
-        best_models.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-        selected = best_models[0]
-        print(f"✅ 选择最佳模型: {selected.name}")
-        return str(selected)
-    
-    # 其次选择 final_model
-    final_models = [f for f in all_models if f.name == 'final_model.pth']
-    if final_models:
-        selected = final_models[0]
-        print(f"✅ 选择最终模型: {selected.name}")
-        return str(selected)
-    
-    # 最后选择任意模型
-    selected = all_models[0]
-    print(f"✅ 选择模型: {selected.name}")
-    return str(selected)
 
-def main_predict():
-    """预测主程序"""
+# ============================================================
+# 预测主程序
+# ============================================================
+
+def main():
     print("="*60)
-    print("第3步：自动分类")
+    print("🚀 成对图片自动分类 (SSIM + 模型预测)")
+    print("="*60)
+    print(f"SSIM 阈值: {SSIM_THRESHOLD}")
+    print(f"SSIM ≥ {SSIM_THRESHOLD} → 自动匹配")
+    print(f"SSIM < {SSIM_THRESHOLD} → 模型预测")
+    print(f"训练类别: {', '.join(TRAIN_CLASSES)}")
     print("="*60)
     
-    # ============================================================
-    # 自动查找最佳模型
-    # ============================================================
-    model_path = find_best_model('./project/checkpoints')
+    # 查找模型文件
+    model_path = find_model_file(CHECKPOINT_DIR)
     
     if model_path is None:
-        print("\n❌ 错误：没有找到训练好的模型！")
-        print("请先运行 part2_training.py 完成模型训练")
+        print(f"❌ 模型不存在: {CHECKPOINT_DIR}")
+        print("请先运行 part2_pair_training.py")
         return
     
-    # 检查输入目录是否存在
-    input_dir = Path('./raw_images_all')
-    if not input_dir.exists():
-        print(f"\n❌ 错误：输入目录不存在: {input_dir}")
-        print("请创建该目录并将待分类的图片放入其中")
+    # 加载模型
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # 加载模型
+    model, num_classes, saved_classes = load_model(model_path, device)
+    
+    if model is None:
+        print("❌ 模型加载失败")
+        print("请检查模型文件是否完整，或重新训练")
         return
     
-    # 创建分类器
-    classifier = AutoClassifier(
-        model_path=model_path,  # 替换为你的模型路径
-        input_dir='./raw_images_all',  # 所有待分类的图像
-        output_dir='./project/06_final_output'
-    )
+    # 数据变换
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                           std=[0.229, 0.224, 0.225])
+    ])
     
-    # 执行分类
-    results = classifier.classify_all(threshold=0.85)
+    # 准备数据
+    dataset = PairPredictionDataset(BEFORE_DIR, AFTER_DIR, transform)
+    if len(dataset) == 0:
+        print("❌ 没有匹配到任何成对图片！")
+        return
     
-    print("\n✅ 分类完成！")
-    print(f"结果目录: ./project/06_final_output")
-    print("  - quality_improved/: 自动分类为质量提升的图像")
-    print("  - render_failed/: 自动分类为渲染失败的图像")
-    print("  - to_review/: 需要人工复核的低置信度图像")
+    dataloader = DataLoader(dataset, batch_size=8, shuffle=False, num_workers=0)
+    
+    # 创建输出目录
+    to_review_dir = OUTPUT_DIR / 'to_review'
+    matched_dir = OUTPUT_DIR / 'matched'
+    
+    for cls in TRAIN_CLASSES:
+        (OUTPUT_DIR / cls).mkdir(parents=True, exist_ok=True)
+    to_review_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 清空旧结果
+    for cls in TRAIN_CLASSES:
+        for item in (OUTPUT_DIR / cls).iterdir():
+            if item.is_dir():
+                shutil.rmtree(item)
+    for item in to_review_dir.iterdir():
+        if item.is_dir():
+            shutil.rmtree(item)
+    
+    results = []
+    auto_matched_count = 0
+    model_predicted_count = 0
+    
+    print(f"\n🔮 开始处理 {len(dataset)} 对图片...\n")
+    
+    with torch.no_grad():
+        for before, after, names, before_paths, after_paths in tqdm(dataloader, desc="处理中"):
+            for i, name in enumerate(names):
+                ssim_score = SSIMComparator.compute_ssim(before_paths[i], after_paths[i])
+                
+                # SSIM ≥ 阈值：自动匹配
+                if ssim_score >= SSIM_THRESHOLD:
+                    pred_class = 'matched'
+                    confidence = ssim_score
+                    auto_matched_count += 1
+                    
+                    dest_dir = matched_dir / name
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(before_paths[i], dest_dir / 'before.png')
+                    shutil.copy2(after_paths[i], dest_dir / 'after.png')
+                    
+                    with open(dest_dir / 'prediction_info.json', 'w') as f:
+                        json.dump({
+                            'name': name,
+                            'predicted_class': pred_class,
+                            'confidence': confidence,
+                            'ssim_score': ssim_score,
+                            'auto_matched': True
+                        }, f, indent=2)
+                    
+                    results.append({
+                        'name': name,
+                        'predicted_class': pred_class,
+                        'confidence': confidence,
+                        'auto_matched': True,
+                        'ssim_score': ssim_score
+                    })
+                    
+                    continue
+                
+                # SSIM < 阈值：模型预测
+                before_tensor = before[i:i+1].to(device)
+                after_tensor = after[i:i+1].to(device)
+                
+                outputs = model(before_tensor, after_tensor)
+                probs = torch.softmax(outputs, dim=1)
+                confidence, pred = torch.max(probs, dim=1)
+                
+                pred_idx = pred.item()
+                if pred_idx < len(saved_classes):
+                    pred_class = saved_classes[pred_idx]
+                else:
+                    pred_class = 'matched'
+                
+                conf = confidence.item()
+                model_predicted_count += 1
+                
+                if conf >= THRESHOLD:
+                    dest_dir = OUTPUT_DIR / pred_class / name
+                else:
+                    dest_dir = to_review_dir / name
+                
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(before_paths[i], dest_dir / 'before.png')
+                shutil.copy2(after_paths[i], dest_dir / 'after.png')
+                
+                with open(dest_dir / 'prediction_info.json', 'w') as f:
+                    json.dump({
+                        'name': name,
+                        'predicted_class': pred_class,
+                        'confidence': conf,
+                        'ssim_score': ssim_score,
+                        'auto_matched': False,
+                        'all_probs': probs[0].cpu().numpy().tolist()
+                    }, f, indent=2)
+                
+                results.append({
+                    'name': name,
+                    'predicted_class': pred_class,
+                    'confidence': conf,
+                    'auto_matched': False,
+                    'ssim_score': ssim_score
+                })
+    
+    # 统计结果
+    total = len(results)
+    class_counts = defaultdict(int)
+    for r in results:
+        class_counts[r['predicted_class']] += 1
+    
+    print("\n" + "="*60)
+    print("📊 预测完成报告")
+    print("="*60)
+    print(f"总成对数: {total}")
+    print(f"自动匹配 (SSIM ≥ {SSIM_THRESHOLD}): {auto_matched_count} ({auto_matched_count/total*100:.1f}%)")
+    print(f"模型预测 (SSIM < {SSIM_THRESHOLD}): {model_predicted_count} ({model_predicted_count/total*100:.1f}%)")
+    print(f"\n类别分布:")
+    for cls, count in class_counts.items():
+        display = LABEL_DISPLAY.get(cls, cls)
+        print(f"  - {display}: {count} 对 ({count/total*100:.1f}%)")
+    
+    # 保存结果摘要
+    summary = {
+        'total_pairs': total,
+        'auto_matched': auto_matched_count,
+        'model_predicted': model_predicted_count,
+        'class_distribution': dict(class_counts),
+        'ssim_threshold': SSIM_THRESHOLD,
+        'model_confidence_threshold': THRESHOLD,
+        'classes': saved_classes,
+        'timestamp': datetime.now().isoformat()
+    }
+    with open(OUTPUT_DIR / 'prediction_summary.json', 'w') as f:
+        json.dump(summary, f, indent=2)
+    
+    to_review_count = len(list(to_review_dir.iterdir()))
+    print(f"\n🎉 分类完成！结果保存在: {OUTPUT_DIR}")
+    for cls in TRAIN_CLASSES:
+        count = class_counts.get(cls, 0)
+        display = LABEL_DISPLAY.get(cls, cls)
+        print(f"  - {display}: {count} 对")
+    print(f"  - 📌 待复核 (to_review): {to_review_count} 个样本")
+    print(f"\n下一步: python part4_review.py 审核结果")
+
 
 if __name__ == "__main__":
-    main_predict()
+    main()
