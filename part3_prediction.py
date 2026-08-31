@@ -6,13 +6,16 @@ part3_pair_prediction.py
 1. 先计算 SSIM 相似度
 2. SSIM ≥ 阈值(默认0.999) → 自动标记为 matched
 3. SSIM < 阈值 → 用模型预测
+    - 置信度 ≥ 阈值 → 归入对应类别
+    - 置信度 < 阈值 → 放入 to_review（待人工复核）
 
-共享配置: model_config.py
-依赖: scikit-image (pip install scikit-image)
+依赖: scikit-image
+安装: pip install scikit-image
 """
 
 import json
 import torch
+import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
@@ -31,8 +34,8 @@ from collections import defaultdict
 
 from model_config import (
     TRAIN_CLASSES, CLASS_TO_IDX, LABEL_DISPLAY,
-    SiameseNetwork, create_model, load_model, find_model_file,
-    SSIM_THRESHOLD
+    load_model, find_model_file,
+    SSIM_THRESHOLD, SSIMComparator
 )
 
 # ============================================================
@@ -97,38 +100,6 @@ class PairPredictionDataset(Dataset):
 
 
 # ============================================================
-# SSIM 计算工具
-# ============================================================
-
-class SSIMComparator:
-    """SSIM 相似度计算工具"""
-    
-    @staticmethod
-    def compute_ssim(img1_path, img2_path):
-        try:
-            img1 = cv2.imread(str(img1_path))
-            img2 = cv2.imread(str(img2_path))
-            
-            if img1 is None or img2 is None:
-                return 0.0
-            
-            img1_gray = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
-            img2_gray = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
-            
-            if img1_gray.shape != img2_gray.shape:
-                h = min(img1_gray.shape[0], img2_gray.shape[0])
-                w = min(img1_gray.shape[1], img2_gray.shape[1])
-                img1_gray = cv2.resize(img1_gray, (w, h))
-                img2_gray = cv2.resize(img2_gray, (w, h))
-            
-            score, _ = ssim(img1_gray, img2_gray, full=True)
-            return score
-        except Exception as e:
-            print(f"⚠️ SSIM 计算失败: {e}")
-            return 0.0
-
-
-# ============================================================
 # 预测主程序
 # ============================================================
 
@@ -137,8 +108,10 @@ def main():
     print("🚀 成对图片自动分类 (SSIM + 模型预测)")
     print("="*60)
     print(f"SSIM 阈值: {SSIM_THRESHOLD}")
-    print(f"SSIM ≥ {SSIM_THRESHOLD} → 自动匹配")
-    print(f"SSIM < {SSIM_THRESHOLD} → 模型预测")
+    print(f"  SSIM ≥ {SSIM_THRESHOLD} → 自动匹配 (matched)")
+    print(f"  SSIM < {SSIM_THRESHOLD} → 模型预测")
+    print(f"    置信度 ≥ {THRESHOLD} → 归入预测类别")
+    print(f"    置信度 < {THRESHOLD} → 放入 to_review (待人工复核)")
     print(f"训练类别: {', '.join(TRAIN_CLASSES)}")
     print("="*60)
     
@@ -152,14 +125,13 @@ def main():
     
     # 加载模型
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # 加载模型
     model, num_classes, saved_classes = load_model(model_path, device)
     
     if model is None:
         print("❌ 模型加载失败")
-        print("请检查模型文件是否完整，或重新训练")
         return
+    
+    print(f"✅ 模型加载完成 (类别数: {num_classes})")
     
     # 数据变换
     transform = transforms.Compose([
@@ -197,15 +169,19 @@ def main():
     results = []
     auto_matched_count = 0
     model_predicted_count = 0
+    low_confidence_count = 0
     
     print(f"\n🔮 开始处理 {len(dataset)} 对图片...\n")
     
     with torch.no_grad():
         for before, after, names, before_paths, after_paths in tqdm(dataloader, desc="处理中"):
             for i, name in enumerate(names):
+                # 计算 SSIM 相似度
                 ssim_score = SSIMComparator.compute_ssim(before_paths[i], after_paths[i])
                 
+                # ============================================================
                 # SSIM ≥ 阈值：自动匹配
+                # ============================================================
                 if ssim_score >= SSIM_THRESHOLD:
                     pred_class = 'matched'
                     confidence = ssim_score
@@ -235,7 +211,9 @@ def main():
                     
                     continue
                 
+                # ============================================================
                 # SSIM < 阈值：模型预测
+                # ============================================================
                 before_tensor = before[i:i+1].to(device)
                 after_tensor = after[i:i+1].to(device)
                 
@@ -252,10 +230,18 @@ def main():
                 conf = confidence.item()
                 model_predicted_count += 1
                 
+                # ============================================================
+                # 判断置信度是否达标
+                # ============================================================
                 if conf >= THRESHOLD:
+                    # 高置信度：归入预测类别
                     dest_dir = OUTPUT_DIR / pred_class / name
+                    status_text = f"✅ 归入 {LABEL_DISPLAY.get(pred_class, pred_class)}"
                 else:
+                    # 低置信度：放入 to_review
                     dest_dir = to_review_dir / name
+                    low_confidence_count += 1
+                    status_text = f"⚠️ 置信度 {conf:.3f} < {THRESHOLD}，放入 to_review"
                 
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(before_paths[i], dest_dir / 'before.png')
@@ -268,16 +254,21 @@ def main():
                         'confidence': conf,
                         'ssim_score': ssim_score,
                         'auto_matched': False,
+                        'low_confidence': conf < THRESHOLD,
                         'all_probs': probs[0].cpu().numpy().tolist()
                     }, f, indent=2)
                 
                 results.append({
                     'name': name,
-                    'predicted_class': pred_class,
+                    'predicted_class': pred_class if conf >= THRESHOLD else 'to_review',
                     'confidence': conf,
                     'auto_matched': False,
-                    'ssim_score': ssim_score
+                    'ssim_score': ssim_score,
+                    'low_confidence': conf < THRESHOLD
                 })
+                
+                # 打印详细状态
+                print(f"  {status_text}: {name} (SSIM: {ssim_score:.6f})")
     
     # 统计结果
     total = len(results)
@@ -291,9 +282,14 @@ def main():
     print(f"总成对数: {total}")
     print(f"自动匹配 (SSIM ≥ {SSIM_THRESHOLD}): {auto_matched_count} ({auto_matched_count/total*100:.1f}%)")
     print(f"模型预测 (SSIM < {SSIM_THRESHOLD}): {model_predicted_count} ({model_predicted_count/total*100:.1f}%)")
+    print(f"  其中高置信度 (≥ {THRESHOLD}): {model_predicted_count - low_confidence_count}")
+    print(f"  其中低置信度 (< {THRESHOLD}): {low_confidence_count} (放入 to_review)")
     print(f"\n类别分布:")
     for cls, count in class_counts.items():
-        display = LABEL_DISPLAY.get(cls, cls)
+        if cls == 'to_review':
+            display = '📌 待复核 (to_review)'
+        else:
+            display = LABEL_DISPLAY.get(cls, cls)
         print(f"  - {display}: {count} 对 ({count/total*100:.1f}%)")
     
     # 保存结果摘要
@@ -301,6 +297,8 @@ def main():
         'total_pairs': total,
         'auto_matched': auto_matched_count,
         'model_predicted': model_predicted_count,
+        'high_confidence': model_predicted_count - low_confidence_count,
+        'low_confidence': low_confidence_count,
         'class_distribution': dict(class_counts),
         'ssim_threshold': SSIM_THRESHOLD,
         'model_confidence_threshold': THRESHOLD,
@@ -314,10 +312,12 @@ def main():
     print(f"\n🎉 分类完成！结果保存在: {OUTPUT_DIR}")
     for cls in TRAIN_CLASSES:
         count = class_counts.get(cls, 0)
-        display = LABEL_DISPLAY.get(cls, cls)
-        print(f"  - {display}: {count} 对")
-    print(f"  - 📌 待复核 (to_review): {to_review_count} 个样本")
-    print(f"\n下一步: python part4_review.py 审核结果")
+        if count > 0:
+            display = LABEL_DISPLAY.get(cls, cls)
+            print(f"  - {display}: {count} 对")
+    print(f"  - 📌 待复核 (to_review): {to_review_count} 个样本 (置信度 < {THRESHOLD})")
+    print(f"\n💡 提示: to_review 中的样本需要人工复核确认分类")
+    print(f"   运行 python part4_review.py -i 进行审核")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 """
 view_renderer.py
-三视图渲染器 - 完全可复用的视图模块
+三视图渲染器 - 共享代码
 
 功能：
 1. Split View：可拖拽分割线
@@ -8,6 +8,7 @@ view_renderer.py
 3. Triple View：三图对比（Before | After | Diff）
 4. 鼠标交互：拖拽分割线、滚轮缩放、平移
 5. 视图状态管理：缩放、平移、分割位置、动画间隔
+6. 视图控制器：共享显示循环
 
 被以下模块使用：
     - part1_data_preparation.py
@@ -19,38 +20,13 @@ import numpy as np
 import time
 
 # ============================================================
-# 标记类型配置
+# 导入类别配置
 # ============================================================
 
-# view_renderer.py - 添加 to_review
-
-ALL_CLASSES = [
-    'to_review',                 # 新增：待复核样本（低置信度）
-    'quality_improved',
-    'quality_degradation',
-    'render_failed',
-    'uncertain_difference',
-    'matched'
-]
-
-LABEL_DISPLAY = {
-    'to_review': '📌 待复核',      # 新增
-    'quality_improved': '✅ 质量提升',
-    'quality_degradation': '⚠️ 质量退化',
-    'render_failed': '❌ 渲染失败',
-    'uncertain_difference': '❓ 不确定差异',
-    'matched': '🔄 匹配'
-}
-
-LABEL_COLORS = {
-    'to_review': '#e67e22',        # 橙色
-    'quality_improved': '#2ecc71',
-    'quality_degradation': '#f39c12',
-    'render_failed': '#e74c3c',
-    'uncertain_difference': '#f1c40f',
-    'matched': '#3498db'
-}
-
+from model_config import (
+    ALL_CLASSES, TRAIN_CLASSES, CLASS_TO_IDX, LABEL_DISPLAY, LABEL_COLORS,
+    ClassType, SSIM_THRESHOLD
+)
 
 # ============================================================
 # 视图状态管理
@@ -138,14 +114,27 @@ class MouseHandler:
         self.view_state = view_state
     
     def callback(self, event, x, y, flags, param):
-        """鼠标回调函数"""
+        """
+        鼠标回调函数
+        
+        Args:
+            param: 可以传递额外的参数，如窗口名称
+        """
         vs = self.view_state
         
+        # ============================================================
+        # 修复: 从 param 获取图像宽度
+        # ============================================================
+        img_width = vs.img_width
+        img_height = vs.img_height
+        
         if event == cv2.EVENT_LBUTTONDOWN:
-            split_x = int(vs.split_pos * vs.img_width)
+            # 检查是否点击在分割线附近（±20像素）
+            split_x = int(vs.split_pos * img_width) if img_width > 0 else 0
             if abs(x - split_x) < 20:
                 vs.is_dragging_split = True
                 vs.last_mouse_x = x
+                print(f"🖱️ 开始拖拽分割线: x={x}, split_x={split_x}")
             else:
                 vs.is_panning = True
                 vs.last_mouse_x = x
@@ -153,9 +142,13 @@ class MouseHandler:
         
         elif event == cv2.EVENT_MOUSEMOVE:
             if vs.is_dragging_split:
-                new_pos = max(0.05, min(0.95, x / vs.img_width))
-                vs.split_pos = new_pos
-                vs.last_mouse_x = x
+                # ============================================================
+                # 修复: 使用 img_width 计算分割位置
+                # ============================================================
+                if img_width > 0:
+                    new_pos = max(0.05, min(0.95, x / img_width))
+                    vs.split_pos = new_pos
+                    vs.last_mouse_x = x
             elif vs.is_panning:
                 dx = x - vs.last_mouse_x
                 dy = y - vs.last_mouse_y
@@ -165,14 +158,138 @@ class MouseHandler:
                 vs.last_mouse_y = y
         
         elif event == cv2.EVENT_LBUTTONUP:
+            if vs.is_dragging_split:
+                print(f"🖱️ 停止拖拽分割线: pos={vs.split_pos:.3f}")
             vs.is_dragging_split = False
             vs.is_panning = False
         
         elif event == cv2.EVENT_MOUSEWHEEL:
             if flags > 0:
                 vs.zoom = min(3.0, vs.zoom * 1.1)
+                print(f"🔍 放大: {vs.zoom:.2f}x")
             else:
                 vs.zoom = max(0.3, vs.zoom / 1.1)
+                print(f"🔍 缩小: {vs.zoom:.2f}x")
+
+
+# ============================================================
+# 键盘事件处理器
+# ============================================================
+
+class KeyboardHandler:
+    """键盘事件处理器"""
+    
+    def __init__(self, view_state):
+        self.view_state = view_state
+    
+    def handle_key(self, key):
+        """
+        处理键盘事件
+        
+        Args:
+            key: OpenCV 按键值
+        
+        Returns:
+            str: 触发的动作
+        """
+        vs = self.view_state
+        
+        if key == ord('v'):
+            vs.toggle_mode()
+            return 'toggle_mode'
+        
+        elif key == ord('r'):
+            vs.reset()
+            return 'reset'
+        
+        elif key == ord('q'):
+            return 'quit'
+        
+        elif key == 81:  # 左箭头
+            vs.adjust_split(-0.02)
+            return 'adjust_split'
+        
+        elif key == 83:  # 右箭头
+            vs.adjust_split(0.02)
+            return 'adjust_split'
+        
+        elif key == 82:  # 上箭头
+            vs.adjust_animation_interval(50)
+            return 'adjust_interval'
+        
+        elif key == 84:  # 下箭头
+            vs.adjust_animation_interval(-50)
+            return 'adjust_interval'
+        
+        return None
+
+
+# ============================================================
+# 视图控制快捷键配置
+# ============================================================
+
+# 视图控制键 (所有模式通用)
+VIEW_CONTROL_KEYS = {
+    ord('v'): 'toggle_mode',
+    ord('r'): 'reset',
+    81: 'adjust_split_left',    # ←
+    83: 'adjust_split_right',   # →
+    82: 'adjust_interval_up',   # ↑
+    84: 'adjust_interval_down', # ↓
+    ord('q'): 'quit',
+}
+
+# 导航键
+NAV_KEYS = {
+    'annotation': {
+        ord('s'): 'skipped',
+        ord('b'): 'back',
+    },
+    'review': {
+        ord('s'): 'skipped',
+        ord('n'): 'next',
+        ord('p'): 'prev',
+    }
+}
+
+
+def get_class_keys(mode='annotation'):
+    """
+    生成分类快捷键映射 (5类: TRAIN_CLASSES)
+    
+    Args:
+        mode: 'annotation' 或 'review'
+    
+    Returns:
+        dict: 按键码 -> 类别值
+    """
+    if mode == 'annotation':
+        key_list = ['1', '2', '3', '4', '5']
+    else:  # review
+        key_list = ['1', '2', '3', '4', '5']
+    
+    keys = {}
+    for i, cls in enumerate(TRAIN_CLASSES):
+        if i < len(key_list):
+            keys[ord(key_list[i])] = cls
+    
+    return keys
+
+
+def get_nav_keys(mode='annotation'):
+    """生成导航键映射"""
+    return NAV_KEYS.get(mode, NAV_KEYS['annotation'])
+
+
+def get_class_shortcut_display(mode='annotation'):
+    """生成快捷键显示文本 (使用显示名称)"""
+    key_map = get_class_keys(mode)
+    lines = []
+    for key_code, cls in key_map.items():
+        key_char = chr(key_code) if 32 < key_code < 127 else '?'
+        display = LABEL_DISPLAY.get(cls, cls)
+        lines.append(f"{key_char}:{display}")
+    return lines
 
 
 # ============================================================
@@ -220,7 +337,7 @@ class ViewRenderer:
         combined = before_resized.copy()
         combined[:, split_x:] = after_resized[:, split_x:]
         
-        # 分割线
+        # 分割线（加粗，更容易点击）
         cv2.line(combined, (split_x, 0), (split_x, target_h), (0, 255, 255), 4)
         cv2.circle(combined, (split_x, 30), 12, (0, 255, 255), -1)
         cv2.circle(combined, (split_x, target_h - 30), 12, (0, 255, 255), -1)
@@ -408,7 +525,7 @@ class ViewRenderer:
             idx: 当前索引
             total_samples: 总样本数
             show_shortcuts: 是否显示快捷键
-            custom_labels: 自定义标签列表 (用于 part1_data_preparation)
+            custom_labels: 自定义标签列表
         
         Returns:
             panel: 信息面板图像
@@ -460,7 +577,7 @@ class ViewRenderer:
         
         # 快捷键
         if custom_labels is not None:
-            # 自定义标签（用于 part1_data_preparation）
+            # 自定义标签
             cv2.putText(panel, "快捷键:", (10, y_offset), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
             y_offset += line_height
@@ -470,15 +587,24 @@ class ViewRenderer:
                 y_offset += line_height
         
         elif show_shortcuts:
-            # 标准快捷键（用于 part4_review）
+            # 标准快捷键
             cv2.putText(panel, "选择新分类:", (10, y_offset), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
             y_offset += line_height
             
-            for i, cls in enumerate(ALL_CLASSES, 1):
+            # 使用 TRAIN_CLASSES 生成快捷键
+            key_map = {
+                'quality_improved': '1',
+                'quality_degradation': '2',
+                'render_failed': '3',
+                'uncertain_difference': '4',
+                'trivial': '5'
+            }
+            for cls in TRAIN_CLASSES:
+                key = key_map.get(cls, '?')
                 display = LABEL_DISPLAY.get(cls, cls)
                 color = ViewRenderer.hex_to_bgr(LABEL_COLORS.get(cls, '#ffffff'))
-                cv2.putText(panel, f"  {i} → {display}", (10, y_offset), 
+                cv2.putText(panel, f"  {key} → {display}", (10, y_offset), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
                 y_offset += line_height
             
@@ -530,6 +656,10 @@ class ViewRenderer:
             pan_y=view_state.pan_y
         )
         
+        # 更新视图状态中的图像尺寸（用于鼠标回调）
+        view_state.img_width = main_view.shape[1]
+        view_state.img_height = main_view.shape[0]
+        
         # 创建信息面板
         panel = ViewRenderer.create_info_panel(
             sample, idx, total_samples,
@@ -552,63 +682,121 @@ class ViewRenderer:
             panel
         ])
         
-        # 更新视图状态中的图像尺寸
-        view_state.img_width = final.shape[1]
-        view_state.img_height = final.shape[0]
-        
         return final
 
 
 # ============================================================
-# 键盘事件处理器
+# 视图控制器
 # ============================================================
 
-class KeyboardHandler:
-    """键盘事件处理器"""
+class ViewController:
+    """
+    视图控制器 - 共享显示循环
     
-    def __init__(self, view_state):
+    供 PairAnnotator 和 PredictionReviewer 共用
+    """
+    
+    def __init__(self, view_state, mouse_handler):
         self.view_state = view_state
+        self.mouse_handler = mouse_handler
+        self.running = True
     
-    def handle_key(self, key):
+    def run(self, before_img, after_img, sample, idx, total_samples,
+            window_name, mode='annotation', 
+            custom_labels=None, show_shortcuts=True,
+            on_action=None):
         """
-        处理键盘事件
+        运行视图循环
         
         Args:
-            key: OpenCV 按键值
+            before_img: before图片
+            after_img: after图片
+            sample: 样本信息
+            idx: 当前索引
+            total_samples: 总样本数
+            window_name: 窗口名称
+            mode: 'annotation' 或 'review'
+            custom_labels: 自定义快捷键标签
+            show_shortcuts: 是否显示快捷键
+            on_action: 回调函数，参数为 action 名称
         
         Returns:
-            str: 触发的动作 ('toggle_mode', 'reset', 'quit', None)
+            str: 用户选择的标签，或 'quit', 'skipped', 'back', 'next', 'prev'
         """
-        vs = self.view_state
+        cv2.namedWindow(window_name)
         
-        if key == ord('v'):
-            vs.toggle_mode()
-            return 'toggle_mode'
+        # 获取快捷键映射
+        class_keys = get_class_keys(mode)
+        nav_keys = get_nav_keys(mode)
         
-        elif key == ord('r'):
-            vs.reset()
-            return 'reset'
+        while self.running:
+            # 创建完整视图（内部会更新 view_state.img_width/height）
+            display = ViewRenderer.create_full_view(
+                before_img, after_img,
+                sample=sample,
+                idx=idx,
+                total_samples=total_samples,
+                view_state=self.view_state,
+                show_shortcuts=show_shortcuts,
+                custom_labels=custom_labels
+            )
+            
+            # ============================================================
+            # 设置鼠标回调 - 传递窗口名称作为 param
+            # ============================================================
+            cv2.setMouseCallback(window_name, self.mouse_handler.callback, window_name)
+            cv2.imshow(window_name, display)
+            
+            key = cv2.waitKey(50) & 0xFF
+            
+            # 1. 处理视图控制键
+            if key in VIEW_CONTROL_KEYS:
+                action = VIEW_CONTROL_KEYS[key]
+                if action == 'toggle_mode':
+                    self.view_state.toggle_mode()
+                elif action == 'reset':
+                    self.view_state.reset()
+                elif action == 'adjust_split_left':
+                    self.view_state.adjust_split(-0.02)
+                elif action == 'adjust_split_right':
+                    self.view_state.adjust_split(0.02)
+                elif action == 'adjust_interval_up':
+                    self.view_state.adjust_animation_interval(50)
+                elif action == 'adjust_interval_down':
+                    self.view_state.adjust_animation_interval(-50)
+                elif action == 'quit':
+                    cv2.destroyAllWindows()
+                    if on_action:
+                        on_action('quit')
+                    return 'quit'
+                continue
+            
+            # 2. 处理分类选择键
+            if key in class_keys:
+                cv2.destroyAllWindows()
+                label = class_keys[key]
+                if on_action:
+                    on_action(label)
+                return label
+            
+            # 3. 处理导航键
+            if key in nav_keys:
+                cv2.destroyAllWindows()
+                action = nav_keys[key]
+                if on_action:
+                    on_action(action)
+                return action
+            
+            # 4. 动画逻辑
+            if self.view_state.display_mode == 'animation':
+                self.view_state.toggle_animation_frame()
+                time.sleep(self.view_state.animation_interval / 1000.0)
         
-        elif key == ord('q'):
-            return 'quit'
-        
-        elif key == 81:  # 左箭头
-            vs.adjust_split(-0.02)
-            return 'adjust_split'
-        
-        elif key == 83:  # 右箭头
-            vs.adjust_split(0.02)
-            return 'adjust_split'
-        
-        elif key == 82:  # 上箭头
-            vs.adjust_animation_interval(50)
-            return 'adjust_interval'
-        
-        elif key == 84:  # 下箭头
-            vs.adjust_animation_interval(-50)
-            return 'adjust_interval'
-        
+        cv2.destroyAllWindows()
         return None
+    
+    def stop(self):
+        self.running = False
 
 
 # ============================================================
@@ -617,7 +805,7 @@ class KeyboardHandler:
 
 def setup_viewer():
     """
-    创建并返回视图组件（ViewState, MouseHandler, KeyboardHandler）
+    创建并返回视图组件
     
     Returns:
         tuple: (view_state, mouse_handler, keyboard_handler)

@@ -7,25 +7,14 @@ part4_review.py
         1. 选择子类别
         2. 选择采样策略（随机/低置信度/均衡/全部）
         3. 浏览和审核样本
-        4. 可修改分类
+        4. 可修改分类（只能修改为 TRAIN_CLASSES 中的 5 类）
         5. 导出到标注集
         6. 生成HTML报告
     
     - 报告模式 (python part4_review.py)：
-        直接从现有审核结果生成HTML报告
-        包含所有样本，按分类显示，鼠标悬停显示缩略图
+        使用 ReportGenerator 生成包含多数据源分类的报告
 
-功能：
-1. 从 06_final_output 读取预测结果
-2. 按子类别筛选审核样本
-3. 支持全部样本浏览模式
-4. 审核UI支持三种视图：Split/Animation/Triple
-5. 可编辑审核结果并保存进度
-6. 修改分类后自动更新 final_output 和统计
-7. 生成可展开缩略图的HTML报告（所有样本，按分类显示）
-8. 导出审核结果到标注集
-
-依赖: view_renderer.py, config_manager.py
+依赖: view_renderer.py, config_manager.py, report_generator.py, model_config.py
 """
 
 import os
@@ -33,7 +22,6 @@ import shutil
 import json
 import cv2
 import numpy as np
-import base64
 import time
 import argparse
 from pathlib import Path
@@ -44,19 +32,23 @@ import webbrowser
 from collections import defaultdict
 
 # ============================================================
-# 导入配置管理模块
+# 导入模块
 # ============================================================
 
 from config_manager import load_config
 
-# ============================================================
-# 导入三视图渲染器
-# ============================================================
-
 from view_renderer import (
     ViewRenderer, ViewState, MouseHandler, KeyboardHandler,
-    setup_viewer, ALL_CLASSES, LABEL_DISPLAY, LABEL_COLORS
+    setup_viewer, ViewController, get_class_shortcut_display
 )
+
+from model_config import (
+    ALL_CLASSES， TRAIN_CLASSES, CLASS_TO_IDX, SSIM_THRESHOLD,
+    LABEL_DISPLAY, LABEL_COLORS,
+    load_model, find_model_file, ClassType
+)
+
+from report_generator import ReportGenerator
 
 # ============================================================
 # 加载配置
@@ -66,7 +58,6 @@ CONFIG = load_config('config.json')
 
 PROJECT_DIR = Path(CONFIG['folders']['project'])
 
-# 目录路径
 OUTPUT_DIR = PROJECT_DIR / "06_final_output"
 REVIEW_DIR = PROJECT_DIR / "07_review"
 ANNOTATED_DIR = PROJECT_DIR / "02_annotated"
@@ -79,13 +70,11 @@ VAL_DIR = PROJECT_DIR / "04_val_data"
 # ============================================================
 
 class PredictionReviewer:
-    """
-    预测后审核比对工具
-    从 06_final_output 读取预测结果
-    """
+    """预测后审核比对工具"""
     
     def __init__(self, interactive=True):
         self.interactive = interactive
+        self.project_dir = PROJECT_DIR
         
         # 检查 final_output 是否存在
         if not OUTPUT_DIR.exists():
@@ -176,7 +165,8 @@ class PredictionReviewer:
         for cls in ALL_CLASSES:
             count = class_counts.get(cls, 0)
             if count > 0:
-                display = LABEL_DISPLAY.get(cls, cls)
+                class_enum = ClassType.from_value(cls)
+                display = class_enum.display_name if class_enum else cls
                 print(f"  - {display}: {count}")
         
         return self.predictions
@@ -226,7 +216,19 @@ class PredictionReviewer:
             json.dump(self.review_history, f, indent=2)
     
     def update_prediction(self, name, new_label, reason=""):
-        """更新预测结果"""
+        """
+        更新预测结果
+        
+        Args:
+            name: 样本名称
+            new_label: 新标签 (必须是 TRAIN_CLASSES 中的类别)
+            reason: 修改原因
+        """
+        # 验证新标签是否在 TRAIN_CLASSES 中
+        if new_label not in TRAIN_CLASSES:
+            print(f"⚠️ 无效标签: {new_label}，必须是 TRAIN_CLASSES 中的类别")
+            return False
+        
         sample = None
         for p in self.predictions:
             if p['name'] == name:
@@ -311,9 +313,9 @@ class PredictionReviewer:
                 pass
         
         return class_counts
-
+    
     def select_subcategories(self):
-        """选择要审核的子类别（包含 to_review）"""
+        """选择要审核的子类别（从 ALL_CLASSES 中选择）"""
         available = sorted(set(p['pred_label'] for p in self.predictions))
         
         # 确保 to_review 排在前面
@@ -327,7 +329,8 @@ class PredictionReviewer:
         print("可用类别:")
         for i, cls in enumerate(available, 1):
             count = sum(1 for p in self.predictions if p['pred_label'] == cls)
-            display = LABEL_DISPLAY.get(cls, cls)
+            class_enum = ClassType.from_value(cls)
+            display = class_enum.display_name if class_enum else cls
             print(f"  {i}. {display} ({count} 个)")
         print(f"  a. 全部类别")
         print(f"  q. 退出")
@@ -346,8 +349,8 @@ class PredictionReviewer:
                 return [available[idx]]
             except:
                 print("无效选择，使用全部类别")
-                return available    
-   
+                return available
+    
     def select_sampling_strategy(self):
         """选择采样策略"""
         print("\n" + "="*60)
@@ -384,14 +387,7 @@ class PredictionReviewer:
         return strategy, sample_size
     
     def sample_for_review(self, selected_classes=None, strategy='all', sample_size=50):
-        """
-        采样进行人工审核
-        
-        Args:
-            selected_classes: 选中的类别列表
-            strategy: 'all', 'random', 'low_confidence', 'balanced'
-            sample_size: 采样数量
-        """
+        """采样进行人工审核"""
         import random
         
         # 按类别筛选
@@ -452,7 +448,8 @@ class PredictionReviewer:
         
         print("\n采样类别分布:")
         for cls, count in class_counts.items():
-            display = LABEL_DISPLAY.get(cls, cls)
+            class_enum = ClassType.from_value(cls)
+            display = class_enum.display_name if class_enum else cls
             print(f"  - {display}: {count}")
         
         return self.review_samples
@@ -480,17 +477,20 @@ class PredictionReviewer:
         print("预测审核工具 - 全部样本浏览模式")
         print("="*70)
         print(f"进度: {len(self.review_results)}/{total_samples} 已审核")
-        print("\n快捷键:")
-        for i, cls in enumerate(ALL_CLASSES, 1):
-            print(f"  {i} → {LABEL_DISPLAY.get(cls, cls)}")
+        print("\n📌 审核分类（必须选择 TRAIN_CLASSES 中的 5 类）:")
+        
+        # 使用 TRAIN_CLASSES 生成快捷键显示
+        shortcut_lines = self._get_review_shortcut_display()
+        for item in shortcut_lines:
+            print(f"  {item}")
+        
+        print("\n📌 操作说明:")
         print("  v → 切换视图模式  ↑↓ → 调整动画间隔")
         print("  r → 重置视图  s → 跳过  q → 退出")
         print("  n → 下一个  p → 上一个")
         print("="*70)
         
-        # 从当前进度开始
         for idx, sample in enumerate(remaining):
-            # 更新进度
             self.current_idx = len(self.review_results)
             
             before_img = cv2.imread(sample['before_path'])
@@ -500,66 +500,36 @@ class PredictionReviewer:
                 print(f"⚠️ 跳过 {sample['name']}: 无法读取图片")
                 continue
             
-            # 重置视图状态
             self.view_state.reset()
             
             window_name = f'审核 - {sample["name"]}'
-            cv2.namedWindow(window_name)
             
-            while True:
-                # 使用共享视图渲染器
-                display = ViewRenderer.create_full_view(
-                    before_img, after_img,
-                    sample=sample,
-                    idx=idx,
-                    total_samples=total_remaining,
-                    view_state=self.view_state,
-                    show_shortcuts=True
-                )
-                
-                # 添加进度信息到视图底部
-                h = display.shape[0]
-                cv2.rectangle(display, (0, h-30), (display.shape[1], h), (0, 0, 0), -1)
-                progress_text = f"进度: {len(self.review_results)}/{total_samples}  |  当前: {idx+1}/{total_remaining}  |  [n]下一个  [p]上一个"
-                cv2.putText(display, progress_text, (10, h-8), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                
-                cv2.setMouseCallback(window_name, self.mouse_handler.callback)
-                cv2.imshow(window_name, display)
-                
-                key = cv2.waitKey(50) & 0xFF
-                
-                # ============================================================
-                # 标记类型选择
-                # ============================================================
-                if key == ord('1'):
-                    cv2.destroyAllWindows()
-                    self.apply_review(sample, ALL_CLASSES[0])
-                    break
-                elif key == ord('2'):
-                    cv2.destroyAllWindows()
-                    self.apply_review(sample, ALL_CLASSES[1])
-                    break
-                elif key == ord('3'):
-                    cv2.destroyAllWindows()
-                    self.apply_review(sample, ALL_CLASSES[2])
-                    break
-                elif key == ord('4'):
-                    cv2.destroyAllWindows()
-                    self.apply_review(sample, ALL_CLASSES[3])
-                    break
-                elif key == ord('5'):
-                    cv2.destroyAllWindows()
-                    self.apply_review(sample, ALL_CLASSES[4])
-                    break
-                
-                # ============================================================
-                # 导航
-                # ============================================================
-                elif key == ord('n'):
-                    # 下一个 - 保存当前并退出循环
-                    cv2.destroyAllWindows()
-                    # 如果没有审核就跳过
+            # 构建样本信息
+            sample_info = {
+                'name': sample['name'],
+                'pred_label': sample['pred_label'],
+                'confidence': sample['confidence'],
+                'auto_matched': sample.get('auto_matched', False),
+                'ssim_score': sample.get('ssim_score', 0)
+            }
+            
+            # 审核快捷键标签（只显示 TRAIN_CLASSES）
+            custom_labels = self._get_review_custom_labels()
+            
+            # 使用共享 ViewController
+            controller = ViewController(self.view_state, self.mouse_handler)
+            
+            # 自定义 action 处理
+            def on_action(action):
+                if action == 'skipped':
+                    print(f"⏭️ 跳过 {sample['name']}")
+                    self.review_results.append({
+                        'name': sample['name'],
+                        'action': 'skipped',
+                        'timestamp': datetime.now().isoformat()
+                    })
+                    self.save_progress()
+                elif action == 'next':
                     if sample['name'] not in [r['name'] for r in self.review_results]:
                         self.review_results.append({
                             'name': sample['name'],
@@ -567,77 +537,117 @@ class PredictionReviewer:
                             'timestamp': datetime.now().isoformat()
                         })
                         self.save_progress()
-                        print(f"⏭️ 跳过 {sample['name']}")
-                    break
-                elif key == ord('p'):
-                    # 上一个 - 回退一个样本
-                    cv2.destroyAllWindows()
-                    # 移除最后一个审核结果（如果有）
+                        print(f"⏭️ 自动跳过 {sample['name']}")
+                elif action == 'prev':
                     if self.review_results and self.review_results[-1]['name'] == sample['name']:
                         self.review_results.pop()
                         self.save_progress()
-                    print(f"⏪ 回退到上一个")
-                    # 重新获取剩余样本
-                    reviewed_names = set(r['name'] for r in self.review_results)
-                    remaining_updated = [s for s in self.review_samples if s['name'] not in reviewed_names]
-                    if remaining_updated:
-                        # 继续循环会处理下一个
-                        pass
-                    break
-                
-                # ============================================================
-                # 视图控制
-                # ============================================================
-                elif key == ord('v'):
-                    self.view_state.toggle_mode()
-                elif key == ord('r'):
-                    self.view_state.reset()
-                elif key == 81:  # 左箭头
-                    self.view_state.adjust_split(-0.02)
-                elif key == 83:  # 右箭头
-                    self.view_state.adjust_split(0.02)
-                elif key == 82:  # 上箭头
-                    self.view_state.adjust_animation_interval(50)
-                elif key == 84:  # 下箭头
-                    self.view_state.adjust_animation_interval(-50)
-                
-                # ============================================================
-                # 其他
-                # ============================================================
-                elif key == ord('s'):
-                    cv2.destroyAllWindows()
-                    self.review_results.append({
-                        'name': sample['name'],
-                        'action': 'skipped',
-                        'timestamp': datetime.now().isoformat()
-                    })
+                        print(f"⏪ 回退 {sample['name']}")
+                elif action == 'quit':
                     self.save_progress()
-                    print(f"⏭️ 跳过 {sample['name']}")
-                    break
-                elif key == ord('q'):
-                    cv2.destroyAllWindows()
-                    self.save_progress()
-                    print("\n✅ 审核进度已保存")
                     self.generate_html_report()
-                    return
-                
-                # ============================================================
-                # 动画逻辑
-                # ============================================================
-                if self.view_state.display_mode == 'animation':
-                    self.view_state.toggle_animation_frame()
-                    time.sleep(self.view_state.animation_interval / 1000.0)
+                    print("\n✅ 审核进度已保存")
+                    sys.exit(0)
+            
+            result = controller.run(
+                before_img, after_img, sample_info, idx, len(remaining),
+                window_name,
+                mode='review',
+                custom_labels=custom_labels,
+                show_shortcuts=True,
+                on_action=on_action
+            )
+            
+            if result == 'quit':
+                self.save_progress()
+                self.generate_html_report()
+                print("\n✅ 审核进度已保存")
+                return
+            elif result == 'skipped':
+                pass
+            elif result in TRAIN_CLASSES:
+                self.apply_review(sample, result)
+            
+            if result == 'back':
+                if self.review_results and self.review_results[-1]['name'] == sample['name']:
+                    self.review_results.pop()
+                    self.save_progress()
+                continue
         
         cv2.destroyAllWindows()
         print("\n🎉 审核完成！")
         self.refresh_statistics()
         self.generate_html_report()
     
+    def _get_review_shortcut_display(self):
+        """获取审核模式的快捷键显示（使用 TRAIN_CLASSES）"""
+        key_map = {
+            'quality_improved': '1',
+            'quality_degradation': '2',
+            'render_failed': '3',
+            'uncertain_difference': '4',
+            'trivial': '5'
+        }
+        lines = []
+        for cls in TRAIN_CLASSES:
+            key = key_map.get(cls, '?')
+            display = LABEL_DISPLAY.get(cls, cls)
+            lines.append(f"  {key} → {display}")
+        return lines
+    
+    def _get_review_custom_labels(self):
+        """获取审核自定义标签（使用 TRAIN_CLASSES）"""
+        key_map = {
+            'quality_improved': '1',
+            'quality_degradation': '2',
+            'render_failed': '3',
+            'uncertain_difference': '4',
+            'trivial': '5'
+        }
+        label_parts = []
+        for cls in TRAIN_CLASSES:
+            key = key_map.get(cls, '?')
+            display = LABEL_DISPLAY.get(cls, cls)
+            label_parts.append(f"{key}:{display}")
+        
+        return [
+            '  '.join(label_parts),
+            'v:切换视图  ←→:分割  ↑↓:间隔  r:重置',
+            's:跳过  n:下一个  p:上一个  q:退出'
+        ]
+    
     def apply_review(self, sample, new_label, reason=""):
-        """应用审核结果"""
+        """
+        应用审核结果
+        
+        Args:
+            sample: 样本信息
+            new_label: 新标签（必须是 TRAIN_CLASSES 中的类别）
+            reason: 修改原因
+        """
+        # 验证新标签是否在 TRAIN_CLASSES 中
+        if new_label not in TRAIN_CLASSES:
+            print(f"⚠️ 无效标签: {new_label}，必须是 TRAIN_CLASSES 中的类别")
+            return
+        
         name = sample['name']
         old_label = sample['pred_label']
         
+        # 检查是否已有审核记录
+        for r in self.review_results:
+            if r['name'] == name:
+                r['old_label'] = old_label
+                r['new_label'] = new_label
+                r['action'] = 'modified' if old_label != new_label else 'confirmed'
+                r['timestamp'] = datetime.now().isoformat()
+                self.save_progress()
+                if old_label != new_label:
+                    print(f"🔄 更新: {name} → {new_label}")
+                else:
+                    print(f"✅ 确认: {name} → {new_label}")
+                return
+        
+        # 新记录
         if old_label == new_label:
             action = 'confirmed'
             print(f"✅ 确认: {name} → {new_label}")
@@ -657,19 +667,17 @@ class PredictionReviewer:
         }
         self.review_results.append(review_entry)
         self.save_progress()
-
+    
     def export_to_annotated(self):
-        """导出审核结果到标注集（跳过 to_review）"""
+        """导出审核结果到标注集"""
         print("\n📦 导出审核结果到标注集...")
         
         if not self.review_results:
             print("❌ 没有审核结果可导出")
             return
         
-        # 创建标注目录（不包含 to_review，因为它不是正式标注类别）
-        train_classes = ['quality_improved', 'quality_degradation', 
-                         'render_failed', 'uncertain_difference', 'matched']
-        for cls in train_classes:
+        # 创建标注目录 (ALL_CLASSES, 7类)
+        for cls in ALL_CLASSES:
             (ANNOTATED_DIR / cls).mkdir(parents=True, exist_ok=True)
         
         exported_count = 0
@@ -682,15 +690,14 @@ class PredictionReviewer:
             if not name or not new_label:
                 continue
             
-            # 跳过 to_review（它不是正式标注类别）
-            if new_label == 'to_review':
-                print(f"⏭️ 跳过 {name}: 仍为待复核状态")
+            # 验证新标签是否在 TRAIN_CLASSES 中
+            if new_label not in TRAIN_CLASSES:
+                print(f"⚠️ 跳过 {name}: 标签 {new_label} 不在 TRAIN_CLASSES 中")
                 continue
             
             # 在 final_output 中查找样本
             source_dir = None
-            all_dirs = ['to_review'] + train_classes
-            for cls in all_dirs:
+            for cls in ALL_CLASSES:
                 possible_dir = OUTPUT_DIR / cls / name
                 if possible_dir.exists():
                     source_dir = possible_dir
@@ -719,657 +726,19 @@ class PredictionReviewer:
             
             exported_count += 1
         
-        print(f"✅ 导出完成: {exported_count} 个样本到 {ANNOTATED_DIR}")    
-     
-        # ============================================================
-        # HTML 报告生成（包含所有样本，按分类显示，鼠标悬停显示缩略图）
-        # ============================================================
-
-        # ============================================================
-        # HTML 报告生成（使用图片文件引用，避免内存溢出）
-        # ============================================================
-        
+        print(f"✅ 导出完成: {exported_count} 个样本到 {ANNOTATED_DIR}")
+    
     def generate_html_report(self):
-        """
-        生成可视化HTML报告
+        """生成HTML报告 - 使用 ReportGenerator"""
+        print("\n📄 生成分类结果报告...")
         
-        使用图片文件引用方式，避免内存溢出
-        """
-        if not self.predictions:
-            print("\n⚠️ 没有预测结果，无法生成报告")
-            return
+        generator = ReportGenerator(self.project_dir)
+        generator.collect_samples()
+        generator.generate_html_report()
         
-        print("\n📄 生成可视化HTML报告...")
-        
-        # 创建报告资源目录
-        report_dir = REVIEW_DIR / 'report_files'
-        report_dir.mkdir(parents=True, exist_ok=True)
-        
-        # 按分类分组
-        grouped = defaultdict(list)
-        for p in self.predictions:
-            grouped[p['pred_label']].append(p)
-        
-        # 统计信息
-        total = len(self.predictions)
-        class_counts = {cls: len(items) for cls, items in grouped.items()}
-        
-        # 审核统计
-        reviewed_names = set(r['name'] for r in self.review_results)
-        modified_names = set(r['name'] for r in self.review_results if r.get('action') == 'modified')
-        
-        # 构建HTML
-        html = self.build_html_report_with_files(
-            grouped, class_counts, total, 
-            reviewed_names, modified_names,
-            report_dir
-        )
-        
-        html_path = REVIEW_DIR / 'review_report.html'
-        with open(html_path, 'w', encoding='utf-8') as f:
-            f.write(html)
-        
-        print(f"✅ HTML报告已生成: {html_path}")
-        print(f"📁 图片资源: {report_dir}")
-        
-        try:
-            webbrowser.open(str(html_path.absolute()))
-            print("🌐 已在浏览器中打开报告")
-        except:
-            print(f"请手动打开: {html_path}")
-    
-    def build_html_report_with_files(self, grouped, class_counts, total, 
-                                      reviewed_names, modified_names,
-                                      report_dir):
-        """构建HTML报告（使用图片文件引用）"""
-        
-        # 清空图片目录
-        for f in report_dir.glob('*'):
-            if f.is_file():
-                f.unlink()
-        
-        # 生成每个类别的HTML
-        class_sections = []
-        display_order = ['to_review', 'render_failed', 'quality_degradation', 
-                 'uncertain_difference', 'quality_improved', 'matched']
+        print(f"\n✅ 报告已生成: {REVIEW_DIR / 'review_report.html'}")
 
-        
-        for cls in display_order:
-            if cls not in grouped:
-                continue
-            
-            items = grouped[cls]
-            display_name = LABEL_DISPLAY.get(cls, cls)
-            color = LABEL_COLORS.get(cls, '#3498db')
-            
-            rows = []
-            for idx, item in enumerate(items):
-                name = item['name']
-                confidence = item.get('confidence', 0)
-                auto_matched = item.get('auto_matched', False)
-                ssim_score = item.get('ssim_score', 0)
-                
-                # 生成缩略图文件
-                thumb_files = self.generate_thumb_files(item, report_dir, idx)
-                
-                # 审核状态
-                if name in modified_names:
-                    status = '🔄 已修改'
-                    status_class = 'modified'
-                elif name in reviewed_names:
-                    status = '✅ 已确认'
-                    status_class = 'confirmed'
-                else:
-                    status = '⏳ 待审核'
-                    status_class = 'pending'
-                
-                conf_display = f"{confidence:.3f}"
-                if auto_matched:
-                    conf_display += " (自动匹配)"
-                elif confidence < 0.6:
-                    conf_display += " ⚠️"
-                
-                # 构建缩略图悬停HTML（使用文件路径）
-                thumb_html = self.build_thumb_html_with_files(thumb_files, name)
-                
-                row_html = '''
-                <tr class="{status_class}">
-                    <td class="sample-name">{name}</td>
-                    <td class="thumb-cell">
-                        {thumb_html}
-                    </td>
-                    <td>{conf_display}</td>
-                    <td>{ssim_display}</td>
-                    <td class="status-{status_class}">{status}</td>
-                </tr>
-                '''.format(
-                    status_class=status_class,
-                    name=name,
-                    thumb_html=thumb_html,
-                    conf_display=conf_display,
-                    ssim_display=f"{ssim_score:.6f}" if ssim_score else '-',
-                    status=status
-                )
-                rows.append(row_html)
-            
-            is_default_expanded = cls == 'render_failed'
-            icon_symbol = '▼' if is_default_expanded else '▶'
-            display_style = 'block' if is_default_expanded else 'none'
-            
-            section_html = '''
-            <div class="class-section">
-                <div class="class-header" onclick="toggleClass('{cls}')" 
-                     style="background: {color}22; border-left: 4px solid {color};">
-                    <span class="class-name">{display_name}</span>
-                    <span class="class-count">{count} 个样本</span>
-                    <span class="toggle-icon" id="icon-{cls}">
-                        {icon_symbol}
-                    </span>
-                </div>
-                <div class="class-body" id="body-{cls}" 
-                     style="display: {display_style};">
-                    <table class="details-table">
-                        <thead>
-                            <tr>
-                                <th>样本名</th>
-                                <th>图片预览 (悬停查看)</th>
-                                <th>置信度</th>
-                                <th>SSIM</th>
-                                <th>状态</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {rows}
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-            '''.format(
-                cls=cls,
-                color=color,
-                display_name=display_name,
-                count=len(items),
-                icon_symbol=icon_symbol,
-                display_style=display_style,
-                rows=''.join(rows)
-            )
-            class_sections.append(section_html)
-        
-        stat_cards = self._build_class_stats(class_counts)
-        
-        html = '''
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>预测结果审核报告</title>
-    <style>
-        * {{ font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; box-sizing: border-box; }}
-        body {{ 
-            background: #f0f2f5; 
-            margin: 0; 
-            padding: 20px;
-            color: #2c3e50;
-        }}
-        .container {{ 
-            max-width: 1400px; 
-            margin: 0 auto; 
-            background: white; 
-            padding: 30px; 
-            border-radius: 12px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }}
-        h1 {{ 
-            color: #2c3e50; 
-            border-bottom: 3px solid #3498db; 
-            padding-bottom: 15px;
-            margin-bottom: 20px;
-        }}
-        .subtitle {{
-            color: #7f8c8d;
-            margin-bottom: 25px;
-            font-size: 14px;
-        }}
-        
-        .stats {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-            gap: 12px;
-            margin: 20px 0 30px 0;
-        }}
-        .stat-card {{
-            background: #f8f9fa;
-            padding: 12px 16px;
-            border-radius: 8px;
-            text-align: center;
-            border-left: 4px solid #3498db;
-        }}
-        .stat-card .number {{
-            font-size: 24px;
-            font-weight: bold;
-            color: #2c3e50;
-        }}
-        .stat-card .label {{
-            font-size: 13px;
-            color: #7f8c8d;
-        }}
-        .stat-card.green {{ border-color: #2ecc71; }}
-        .stat-card.orange {{ border-color: #f39c12; }}
-        .stat-card.red {{ border-color: #e74c3c; }}
-        .stat-card.blue {{ border-color: #3498db; }}
-        .stat-card.purple {{ border-color: #9b59b6; }}
-        
-        .class-section {{
-            margin: 15px 0;
-            border: 1px solid #e0e0e0;
-            border-radius: 8px;
-            overflow: hidden;
-        }}
-        .class-header {{
-            padding: 12px 20px;
-            cursor: pointer;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            user-select: none;
-            transition: background 0.2s;
-        }}
-        .class-header:hover {{
-            filter: brightness(0.95);
-        }}
-        .class-name {{
-            font-size: 16px;
-            font-weight: 600;
-        }}
-        .class-count {{
-            font-size: 14px;
-            color: #7f8c8d;
-            margin-left: auto;
-            margin-right: 15px;
-        }}
-        .toggle-icon {{
-            font-size: 16px;
-            font-weight: bold;
-            color: #7f8c8d;
-            transition: transform 0.3s;
-        }}
-        .class-body {{
-            padding: 0;
-            overflow-x: auto;
-        }}
-        
-        .details-table {{
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 13px;
-        }}
-        .details-table th {{
-            background: #34495e;
-            color: white;
-            padding: 10px 12px;
-            text-align: left;
-            position: sticky;
-            top: 0;
-            z-index: 10;
-        }}
-        .details-table td {{
-            padding: 8px 12px;
-            border-bottom: 1px solid #ecf0f1;
-            vertical-align: middle;
-        }}
-        .details-table tr:hover {{
-            background: #f8f9fa;
-        }}
-        
-        .status-confirmed {{ color: #27ae60; }}
-        .status-modified {{ color: #e67e22; }}
-        .status-pending {{ color: #95a5a6; }}
-        
-        .details-table tr.confirmed {{
-            border-left: 3px solid #2ecc71;
-        }}
-        .details-table tr.modified {{
-            border-left: 3px solid #f39c12;
-        }}
-        .details-table tr.pending {{
-            border-left: 3px solid #bdc3c7;
-        }}
-        
-        .thumb-cell {{
-            position: relative;
-            width: 120px;
-            min-width: 120px;
-        }}
-        .thumb-trigger {{
-            color: #3498db;
-            cursor: pointer;
-            font-size: 13px;
-            padding: 4px 10px;
-            border: 1px dashed #3498db;
-            border-radius: 4px;
-            display: inline-block;
-            background: #f0f7ff;
-            transition: all 0.2s;
-        }}
-        .thumb-trigger:hover {{
-            background: #3498db;
-            color: white;
-        }}
-        
-        .thumb-popup {{
-            display: none;
-            position: fixed;
-            z-index: 1000;
-            background: white;
-            border-radius: 10px;
-            box-shadow: 0 8px 30px rgba(0,0,0,0.3);
-            padding: 12px;
-            max-width: 700px;
-            min-width: 400px;
-            pointer-events: none;
-            border: 2px solid #e0e0e0;
-        }}
-        .thumb-popup.show {{
-            display: block;
-        }}
-        .thumb-popup .thumb-row {{
-            display: flex;
-            gap: 8px;
-            align-items: center;
-            justify-content: center;
-        }}
-        .thumb-popup .thumb-img {{
-            max-width: 200px;
-            max-height: 150px;
-            border-radius: 6px;
-            border: 1px solid #ddd;
-            object-fit: contain;
-        }}
-        .thumb-popup .thumb-label {{
-            text-align: center;
-            font-size: 11px;
-            color: #7f8c8d;
-            margin-top: 2px;
-        }}
-        .thumb-popup .thumb-arrow {{
-            font-size: 20px;
-            color: #95a5a6;
-            padding: 0 4px;
-        }}
-        .thumb-popup .sample-name-popup {{
-            text-align: center;
-            font-weight: 600;
-            font-size: 12px;
-            color: #2c3e50;
-            margin-bottom: 6px;
-            background: #f0f2f5;
-            padding: 4px 10px;
-            border-radius: 4px;
-        }}
-        
-        .footer {{
-            margin-top: 30px;
-            padding-top: 15px;
-            border-top: 1px solid #ecf0f1;
-            color: #95a5a6;
-            font-size: 13px;
-            text-align: center;
-        }}
-        
-        @media (max-width: 768px) {{
-            .stats {{ grid-template-columns: repeat(2, 1fr); }}
-            .details-table {{ font-size: 12px; }}
-            .thumb-popup {{
-                max-width: 300px;
-                min-width: 200px;
-            }}
-            .thumb-popup .thumb-img {{
-                max-width: 100px;
-                max-height: 80px;
-            }}
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>📊 预测结果审核报告</h1>
-        <div class="subtitle">
-            生成时间: {timestamp} &nbsp;|&nbsp; 
-            总计: {total} 个样本
-        </div>
-        
-        <div class="stats">
-            <div class="stat-card blue">
-                <div class="number">{total}</div>
-                <div class="label">📊 总样本</div>
-            </div>
-            <div class="stat-card green">
-                <div class="number">{reviewed_count}</div>
-                <div class="label">✅ 已审核</div>
-            </div>
-            <div class="stat-card orange">
-                <div class="number">{modified_count}</div>
-                <div class="label">🔄 已修改</div>
-            </div>
-            {stat_cards}
-        </div>
-        
-        <div style="margin: 15px 0 20px 0; font-size: 13px; display: flex; gap: 20px; flex-wrap: wrap;">
-            <span><span style="display:inline-block;width:12px;height:12px;background:#2ecc71;border-radius:2px;"></span> 已确认</span>
-            <span><span style="display:inline-block;width:12px;height:12px;background:#f39c12;border-radius:2px;"></span> 已修改</span>
-            <span><span style="display:inline-block;width:12px;height:12px;background:#bdc3c7;border-radius:2px;"></span> 待审核</span>
-            <span style="color:#7f8c8d;">💡 点击类别标题展开/收起</span>
-            <span style="color:#7f8c8d;">🖱️ 悬停 "查看图片" 预览 before/after/diff</span>
-        </div>
-        
-        {class_sections}
-        
-        <div class="footer">
-            报告由 Review Tool 自动生成 &nbsp;|&nbsp; 
-            <span style="color:#e74c3c;">render_failed</span> 类别默认展开
-        </div>
-    </div>
-    
-    <div class="thumb-popup" id="thumbPopup">
-        <div class="sample-name-popup" id="popupName">样本名</div>
-        <div class="thumb-row">
-            <div>
-                <div class="thumb-label">BEFORE</div>
-                <img class="thumb-img" id="popupBefore" src="" alt="before" />
-            </div>
-            <span class="thumb-arrow">→</span>
-            <div>
-                <div class="thumb-label">AFTER</div>
-                <img class="thumb-img" id="popupAfter" src="" alt="after" />
-            </div>
-            <span class="thumb-arrow">→</span>
-            <div>
-                <div class="thumb-label">DIFF</div>
-                <img class="thumb-img" id="popupDiff" src="" alt="diff" />
-            </div>
-        </div>
-    </div>
-    
-    <script>
-        function toggleClass(cls) {{
-            var body = document.getElementById('body-' + cls);
-            var icon = document.getElementById('icon-' + cls);
-            if (body.style.display === 'none') {{
-                body.style.display = 'block';
-                icon.textContent = '▼';
-            }} else {{
-                body.style.display = 'none';
-                icon.textContent = '▶';
-            }}
-        }}
-        
-        var popup = document.getElementById('thumbPopup');
-        var popupBefore = document.getElementById('popupBefore');
-        var popupAfter = document.getElementById('popupAfter');
-        var popupDiff = document.getElementById('popupDiff');
-        var popupName = document.getElementById('popupName');
-        var hideTimeout = null;
-        
-        function showThumbPopup(event, name, beforeSrc, afterSrc, diffSrc) {{
-            if (hideTimeout) {{
-                clearTimeout(hideTimeout);
-                hideTimeout = null;
-            }}
-            
-            popupName.textContent = name;
-            popupBefore.src = beforeSrc || '';
-            popupAfter.src = afterSrc || '';
-            popupDiff.src = diffSrc || '';
-            
-            var rect = event.target.getBoundingClientRect();
-            var left = rect.left + rect.width / 2 - 200;
-            var top = rect.bottom + 10;
-            
-            if (left < 10) left = 10;
-            if (left + 400 > window.innerWidth - 10) left = window.innerWidth - 410;
-            if (top + 200 > window.innerHeight - 10) {{
-                top = rect.top - 220;
-            }}
-            
-            popup.style.left = left + 'px';
-            popup.style.top = top + 'px';
-            popup.classList.add('show');
-        }}
-        
-        function hideThumbPopup() {{
-            hideTimeout = setTimeout(function() {{
-                popup.classList.remove('show');
-                hideTimeout = null;
-            }}, 200);
-        }}
-        
-        popup.addEventListener('mouseenter', function() {{
-            if (hideTimeout) {{
-                clearTimeout(hideTimeout);
-                hideTimeout = null;
-            }}
-        }});
-        
-        popup.addEventListener('mouseleave', function() {{
-            hideThumbPopup();
-        }});
-    </script>
-</body>
-</html>
-        '''.format(
-            timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            total=total,
-            reviewed_count=len(reviewed_names),
-            modified_count=len(modified_names),
-            stat_cards=stat_cards,
-            class_sections=''.join(class_sections)
-        )
-        
-        return html
-    
-    def generate_thumb_files(self, item, report_dir, idx):
-        """
-        生成缩略图文件（before, after, diff）
-        
-        Returns:
-            dict: {'before': 'path', 'after': 'path', 'diff': 'path'}
-        """
-        name = item['name']
-        thumb_files = {}
-        
-        try:
-            # Before 图片
-            before_path = Path(item['before_path'])
-            if before_path.exists():
-                before_dest = report_dir / f"{name}_before.png"
-                shutil.copy2(before_path, before_dest)
-                thumb_files['before'] = f"report_files/{name}_before.png"
-            
-            # After 图片
-            after_path = Path(item['after_path'])
-            if after_path.exists():
-                after_dest = report_dir / f"{name}_after.png"
-                shutil.copy2(after_path, after_dest)
-                thumb_files['after'] = f"report_files/{name}_after.png"
-            
-            # Diff 图片（生成）
-            diff_data = self.compute_diff_image_data(item['before_path'], item['after_path'])
-            if diff_data:
-                diff_dest = report_dir / f"{name}_diff.png"
-                with open(diff_dest, 'wb') as f:
-                    f.write(diff_data)
-                thumb_files['diff'] = f"report_files/{name}_diff.png"
-        
-        except Exception as e:
-            print(f"⚠️ 生成缩略图失败 {name}: {e}")
-        
-        return thumb_files
-    
-    def compute_diff_image_data(self, before_path, after_path):
-        """计算差异图并返回PNG数据"""
-        try:
-            before = cv2.imread(before_path)
-            after = cv2.imread(after_path)
-            
-            if before is None or after is None:
-                return None
-            
-            if before.shape != after.shape:
-                h = min(before.shape[0], after.shape[0])
-                w = min(before.shape[1], after.shape[1])
-                before = cv2.resize(before, (w, h))
-                after = cv2.resize(after, (w, h))
-            
-            diff = cv2.absdiff(before, after)
-            diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-            diff_colored = cv2.applyColorMap(diff_gray, cv2.COLORMAP_JET)
-            
-            _, buffer = cv2.imencode('.png', diff_colored)
-            return buffer.tobytes()
-        except Exception as e:
-            print(f"⚠️ 计算差异图失败: {e}")
-            return None
-    
-    def build_thumb_html_with_files(self, thumb_files, name):
-        """构建缩略图悬停HTML（使用文件路径）"""
-        before_src = thumb_files.get('before', '')
-        after_src = thumb_files.get('after', '')
-        diff_src = thumb_files.get('diff', '')
-        
-        name_escaped = name.replace("'", "\\'")
-        
-        return '''
-        <span class="thumb-trigger" 
-              onmouseenter="showThumbPopup(event, '{name}', '{before}', '{after}', '{diff}')"
-              onmouseleave="hideThumbPopup()">
-            🖼️ 查看图片
-        </span>
-        '''.format(
-            name=name_escaped,
-            before=before_src,
-            after=after_src,
-            diff=diff_src
-        )
-    
-    def _build_class_stats(self, class_counts):
-        """构建类别统计卡片"""
-        cards = []
-        for cls in ALL_CLASSES:
-            count = class_counts.get(cls, 0)
-            if count == 0:
-                continue
-            color = LABEL_COLORS.get(cls, '#3498db')
-            display = LABEL_DISPLAY.get(cls, cls)
-            cards.append(f'''
-            <div class="stat-card" style="border-color: {color};">
-                <div class="number">{count}</div>
-                <div class="label">{display}</div>
-            </div>
-            ''')
-        return ''.join(cards)
-    
-   
+
 # ============================================================
 # 主程序
 # ============================================================
@@ -1390,7 +759,7 @@ def main():
     reviewer = PredictionReviewer(interactive=args.interactive)
     
     if not args.interactive:
-        # 报告模式：直接从现有结果生成HTML
+        # 报告模式：使用 ReportGenerator
         reviewer.generate_html_report()
         return
     
@@ -1427,6 +796,10 @@ def main():
         reviewer.export_to_annotated()
         print(f"\n💡 标注数据已保存到: {ANNOTATED_DIR}")
         print(f"   运行 part2_training.py 重新训练模型")
+    
+    # 6. 生成报告
+    print("\n📄 生成最终报告...")
+    reviewer.generate_html_report()
     
     print("\n" + "="*60)
     print("✅ 审核完成!")
