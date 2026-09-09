@@ -33,9 +33,9 @@ Classify types of difference between `grdawn_vk` vs baseline(`glesdmsaa`) as
 
 These cases fail due to platform configuration, existing in both ganesh and graphite.
 
-| Sub-category | Description                                                                                                                                                                      | Count |
-| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
-| Font missing | missing font /system/fonts/NotoColorEmojiLegacy.ttf<br>scaledemojiperspective_svg<br>scaledemojiperspective_colrv0<br>scaledemojiperspective_sbix<br>scaledemojiperspective_cbdt | 4     |
+| Sub-category | Count | Cases                                                                                                                     | Description                                         |
+| ------------ | ----- | ------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- |
+| Font missing | 4     | scaledemojiperspective_svg<br>scaledemojiperspective_colrv0<br>scaledemojiperspective_sbix<br>scaledemojiperspective_cbdt | missing font /system/fonts/NotoColorEmojiLegacy.ttf |
 
 
 
@@ -70,7 +70,7 @@ These cases rely on features only exist in ganesh.
 #### Rectangle
 ---
 
-| Category                     | Case                                                                                                         | Description                                                                                                                                                | Could be Improvement? |
+| Category                     | Cases                                                                                                        | Description                                                                                                                                                | Could be Improvement? |
 | ---------------------------- | ------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------- |
 | Rectangle size numeric error | bigrect                                                                                                      | drawRect:<br>stroke style + (stroke width == 0): numeric overflow?(rect size>5e10f)<br>fill style + noaa: less blur, stoke rectangle shifting              |                       |
 |                              | clipdrawdraw                                                                                                 | drawRect: clipping rounding error(0.5 vs 0.499), <br> - graphite: one pixel shifting                                                                       |                       |
@@ -93,7 +93,7 @@ These cases rely on features only exist in ganesh.
 #### Vertices
 ---
 
-| Category                  | Case                                                                                                                                                                               | Description                                                                                                     |
+| Category                  | Cases                                                                                                                                                                              | Description                                                                                                     |
 | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
 | drawAtlas support         | imagefiltersbase<br>skbug_14554                                                                                                                                                    | - graphite:  `SkDevice::drawAtlas` -> `SkVertices::Builder` + `graphite::Device::drawVertices` = disappear      |
 | graphite test API support | picture_mesh                                                                                                                                                                       | using ganesh version of `SkMeshes::CopyVertexBuffer` with `GrDirectContext` parameter.<br>- graphite:  no draw. |
@@ -105,7 +105,7 @@ These cases rely on features only exist in ganesh.
 #### Path Shape
 ---
 
-| Category                     | Case                                                                                                                                                                     | Description                                                                                                              |
+| Category                     | Cases                                                                                                                                                                    | Description                                                                                                              |
 | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
 | Stroke style issue           | degeneratesegments                                                                                                                                                       | - stroke_and_fill + inverse(Even/Odd or winding) = disappear<br>- stroke + inverse(Even/Odd or winding) = inverse result |
 |                              | lineclosepath<br>linepath                                                                                                                                                | same                                                                                                                     |
@@ -121,7 +121,7 @@ These cases rely on features only exist in ganesh.
 #### Other Primitive Types
 ---
 
-| Category         | Case                            | Description                                                                                                                                                    |
+| Category         | Cases                           | Description                                                                                                                                                    |
 | ---------------- | ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Arc Stroke Style | circular_arcs_stroke_butt       | parameters: kButt_Cap strokeCap + useCenter(true) + sweep(90)+start(10,30) or sweep(180)+start(30)<br> - ganesh: no overlap<br> - graphite: extra overlap area |
 | Font stroke      | scaledemojiperspective_test     | perspective + glyph font<br>- graphite: thick stroke of 2nd character(ok without perspective)                                                                  |
@@ -132,7 +132,7 @@ These cases rely on features only exist in ganesh.
 #### NonDraw Ops
 ---
 
-| Category | Case                                                                                                                                                                                                                                                   | Description |
+| Category | Cases                                                                                                                                                                                                                                                  | Description |
 | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------- |
 | TBD      | wacky_yuv_formats<br>wacky_yuv_formats_cs<br>wacky_yuv_formats_cubic<br>wacky_yuv_formats_domain<br>wacky_yuv_formats_fromimages<br>wacky_yuv_formats_limited<br>wacky_yuv_formats_limited_cs<br>wacky_yuv_formats_limited_fromimages<br>yuv_splittert |             |
 
